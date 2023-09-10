@@ -1703,9 +1703,9 @@ dependencies = [
 
 [[package]]
 name = "http-acl"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9e09308830e6e56d68408f5be64c01be186d436838da9d8986eefd344108cae"
+checksum = "55476115db4d4fee061b9632ab9dc155a7c208a644740d655e57175022a2a50d"
 dependencies = [
  "ipnet",
  "url",

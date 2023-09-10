@@ -118,16 +118,24 @@ impl WasiHttp {
             bail!("Port {} is not allowed - {}", port, acl_port_match);
         }
 
+        let mut static_dns_mapping = false;
+
         let tcp_addresses = match &authority.host {
             http_acl::utils::authority::Host::Domain(domain) => {
-                let acl_host_match = self.acl.is_host_allowed(domain);
-                if acl_host_match.is_denied() {
-                    bail!("Host {} is not allowed - {}", domain, acl_host_match);
-                }
+                if let Some(tcp_address) = self.acl.resolve_static_dns_mapping(domain) {
+                    static_dns_mapping = true;
 
-                tokio::net::lookup_host(&(domain.clone() + ":" + &port.to_string()))
-                    .await?
-                    .collect::<Vec<_>>()
+                    vec![tcp_address]
+                } else {
+                    let acl_host_match = self.acl.is_host_allowed(domain);
+                    if acl_host_match.is_denied() {
+                        bail!("Host {} is not allowed - {}", domain, acl_host_match);
+                    }
+
+                    tokio::net::lookup_host(&(domain.clone() + ":" + &port.to_string()))
+                        .await?
+                        .collect::<Vec<_>>()
+                }
             }
             http_acl::utils::authority::Host::Ip(ip) => {
                 let acl_ip_match = self.acl.is_ip_allowed(ip);
@@ -139,10 +147,12 @@ impl WasiHttp {
             }
         };
 
-        for tcp_address in &tcp_addresses {
-            let acl_ip_match = self.acl.is_ip_allowed(&tcp_address.ip());
-            if acl_ip_match.is_denied() {
-                bail!("IP {} is not allowed - {}", tcp_address.ip(), acl_ip_match);
+        if !static_dns_mapping {
+            for tcp_address in &tcp_addresses {
+                let acl_ip_match = self.acl.is_ip_allowed(&tcp_address.ip());
+                if acl_ip_match.is_denied() {
+                    bail!("IP {} is not allowed - {}", tcp_address.ip(), acl_ip_match);
+                }
             }
         }
 
