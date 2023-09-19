@@ -1703,11 +1703,12 @@ dependencies = [
 
 [[package]]
 name = "http-acl"
-version = "0.5.4"
+version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55476115db4d4fee061b9632ab9dc155a7c208a644740d655e57175022a2a50d"
+checksum = "9f5d995681edd23f96a5d7828d8aa12957e6f9a1dd046673a0077c020348d2b6"
 dependencies = [
  "ipnet",
+ "matchit",
  "url",
 ]
 
@@ -2083,6 +2084,12 @@ checksum = "8263075bb86c5a1b1427b5ae862e8889656f126e9f77c484496e8b47cf5c5558"
 dependencies = [
  "regex-automata 0.1.10",
 ]
+
+[[package]]
+name = "matchit"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed1202b2a6f884ae56f04cff409ab315c5ce26b5e58d7412e484f01fd52f52ef"
 
 [[package]]
 name = "maybe-owned"

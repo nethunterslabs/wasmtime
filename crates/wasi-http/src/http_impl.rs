@@ -156,6 +156,17 @@ impl WasiHttp {
             }
         }
 
+        if let Some(url_path) = request.path_with_query.split('?').next() {
+            let acl_url_path_match = self.acl.is_url_path_allowed(url_path);
+            if acl_url_path_match.is_denied() {
+                bail!(
+                    "URL Path {} is not allowed - {}",
+                    url_path,
+                    acl_url_path_match
+                );
+            }
+        }
+
         // Largely adapted from https://hyper.rs/guides/1/client/basic/
         let mut sender = if scheme == "https" {
             #[cfg(not(any(target_arch = "riscv64", target_arch = "s390x")))]
