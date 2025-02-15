@@ -5,15 +5,18 @@ use crate::io::TokioIo;
 use crate::{
     bindings::http::types::{self, Method, Scheme},
     body::{HostIncomingBody, HyperIncomingBody, HyperOutgoingBody},
-    error::dns_error,
+    error::{dns_error, internal_error},
     hyper_request_error,
 };
 use anyhow::bail;
 use bytes::Bytes;
+use http_acl::HttpAcl;
 use http_body_util::BodyExt;
 use hyper::body::Body;
 use hyper::header::HeaderName;
 use std::any::Any;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -23,13 +26,36 @@ use wasmtime_wasi::{runtime::AbortOnDropJoinHandle, Subscribe};
 /// Capture the state necessary for use in the wasi-http API implementation.
 #[derive(Debug)]
 pub struct WasiHttpCtx {
+    pub(crate) acl: Arc<HttpAcl>,
     _priv: (),
 }
 
 impl WasiHttpCtx {
     /// Create a new context.
     pub fn new() -> Self {
-        Self { _priv: () }
+        Self {
+            acl: Arc::new(
+                HttpAcl::builder()
+                    .host_acl_default(true)
+                    .port_acl_default(true)
+                    .ip_acl_default(true)
+                    .build(),
+            ),
+            _priv: (),
+        }
+    }
+
+    /// Create a new context with the provided ACL.
+    pub fn new_with_acl(acl: HttpAcl) -> Self {
+        Self {
+            acl: Arc::new(acl),
+            _priv: (),
+        }
+    }
+
+    /// Returns the ACL for this context.
+    pub fn acl(&self) -> &HttpAcl {
+        self.acl.as_ref()
     }
 }
 
@@ -323,6 +349,10 @@ pub struct OutgoingRequestConfig {
     pub first_byte_timeout: Duration,
     /// The timeout between chunks of a streaming body
     pub between_bytes_timeout: Duration,
+    /// Reference to the ACL to use for this request.
+    pub acl: Arc<HttpAcl>,
+    /// Parsed authority for the request.
+    pub authority: http_acl::utils::authority::Authority,
 }
 
 /// The default implementation of how an outgoing request is sent.
@@ -350,36 +380,102 @@ pub async fn default_send_request_handler(
         connect_timeout,
         first_byte_timeout,
         between_bytes_timeout,
+        acl,
+        authority: authority_parsed,
     }: OutgoingRequestConfig,
 ) -> Result<IncomingResponse, types::ErrorCode> {
+    let port;
     let authority = if let Some(authority) = request.uri().authority() {
-        if authority.port().is_some() {
+        if let Some(port_value) = authority.port() {
+            port = port_value.as_u16();
             authority.to_string()
         } else {
-            let port = if use_tls { 443 } else { 80 };
+            port = if use_tls { 443 } else { 80 };
             format!("{}:{port}", authority.to_string())
         }
     } else {
         return Err(types::ErrorCode::HttpRequestUriInvalid);
     };
-    let tcp_stream = timeout(connect_timeout, TcpStream::connect(&authority))
-        .await
-        .map_err(|_| types::ErrorCode::ConnectionTimeout)?
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::AddrNotAvailable => {
-                dns_error("address not available".to_string(), 0)
+
+    let mut static_dns_mapping = false;
+
+    let tcp_addresses = match &authority_parsed.host {
+        http_acl::utils::authority::Host::Domain(domain) => {
+            if let Some(tcp_address) = acl.resolve_static_dns_mapping(domain) {
+                static_dns_mapping = true;
+
+                vec![tcp_address]
+            } else {
+                let acl_host_match = acl.is_host_allowed(domain);
+                if acl_host_match.is_denied() {
+                    return Err(internal_error(format!(
+                        "Host {domain} is not allowed - {acl_host_match}",
+                    ))
+                    .into());
+                }
+
+                timeout(
+                    connect_timeout,
+                    tokio::net::lookup_host((domain.as_str(), port)),
+                )
+                .await
+                .map_err(|_| types::ErrorCode::DnsTimeout)?
+                .map_err(|e| {
+                    tracing::warn!("dns lookup error: {e:?}");
+                    dns_error("dns lookup error".to_string(), 0)
+                })?
+                .collect::<Vec<_>>()
+            }
+        }
+        http_acl::utils::authority::Host::Ip(ip) => {
+            let acl_ip_match = acl.is_ip_allowed(ip);
+            if acl_ip_match.is_denied() {
+                return Err(
+                    internal_error(format!("IP {ip} is not allowed - {acl_ip_match}",)).into(),
+                );
             }
 
-            _ => {
-                if e.to_string()
-                    .starts_with("failed to lookup address information")
-                {
-                    dns_error("address not available".to_string(), 0)
-                } else {
-                    types::ErrorCode::ConnectionRefused
-                }
+            vec![SocketAddr::new(*ip, port)]
+        }
+    };
+
+    if tcp_addresses.is_empty() {
+        return Err(dns_error("dns lookup error".to_string(), 0));
+    }
+
+    if !static_dns_mapping {
+        for tcp_address in &tcp_addresses {
+            let acl_ip_match = acl.is_ip_allowed(&tcp_address.ip());
+            if acl_ip_match.is_denied() {
+                return Err(internal_error(format!(
+                    "IP {} is not allowed - {}",
+                    tcp_address.ip(),
+                    acl_ip_match,
+                ))
+                .into());
             }
-        })?;
+        }
+    }
+
+    let tcp_stream = timeout(
+        connect_timeout,
+        TcpStream::connect(tcp_addresses.as_slice()),
+    )
+    .await
+    .map_err(|_| types::ErrorCode::ConnectionTimeout)?
+    .map_err(|e| match e.kind() {
+        std::io::ErrorKind::AddrNotAvailable => dns_error("address not available".to_string(), 0),
+
+        _ => {
+            if e.to_string()
+                .starts_with("failed to lookup address information")
+            {
+                dns_error("address not available".to_string(), 0)
+            } else {
+                types::ErrorCode::ConnectionRefused
+            }
+        }
+    })?;
 
     let (mut sender, worker) = if use_tls {
         #[cfg(any(target_arch = "riscv64", target_arch = "s390x"))]

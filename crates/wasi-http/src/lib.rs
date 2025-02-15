@@ -237,6 +237,8 @@ pub use crate::types::{
     DEFAULT_OUTGOING_BODY_CHUNK_SIZE,
 };
 
+pub use http_acl;
+
 /// Add all of the `wasi:http/proxy` world's interfaces to a [`wasmtime::component::Linker`].
 ///
 /// This function will add the `async` variant of all interfaces into the

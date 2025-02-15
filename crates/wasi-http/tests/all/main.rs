@@ -1,6 +1,7 @@
 use crate::http_server::Server;
 use anyhow::{anyhow, Context, Result};
 use futures::{channel::oneshot, future, stream, FutureExt};
+use http_acl::{HttpAcl, HttpRequestMethod, IpNet};
 use http_body::Frame;
 use http_body_util::{combinators::BoxBody, BodyExt, Collected, Empty, StreamBody};
 use hyper::{body::Bytes, server::conn::http1, service::service_fn, Method, StatusCode};
@@ -79,6 +80,31 @@ impl WasiHttpView for Ctx {
     }
 }
 
+fn http_acl() -> HttpAcl {
+    HttpAcl::builder()
+        .clear_allowed_methods()
+        .add_allowed_method(HttpRequestMethod::GET)
+        .unwrap()
+        .add_allowed_method(HttpRequestMethod::POST)
+        .unwrap()
+        .add_allowed_method(HttpRequestMethod::PUT)
+        .unwrap()
+        .add_allowed_host("localhost".to_string())
+        .unwrap()
+        .add_allowed_port_range(3000..=3000)
+        .unwrap()
+        .add_allowed_ip_range("127.0.0.0/8".parse::<IpNet>().unwrap())
+        .unwrap()
+        .add_allowed_ip_range("203.0.113.12/32".parse::<IpNet>().unwrap())
+        .unwrap()
+        .ip_acl_default(true)
+        .host_acl_default(true)
+        .port_acl_default(true)
+        .method_acl_default(true)
+        .url_path_acl_default(true)
+        .build()
+}
+
 fn store(engine: &Engine, server: &Server) -> Store<Ctx> {
     let stdout = MemoryOutputPipe::new(4096);
     let stderr = MemoryOutputPipe::new(4096);
@@ -91,7 +117,7 @@ fn store(engine: &Engine, server: &Server) -> Store<Ctx> {
     let ctx = Ctx {
         table: ResourceTable::new(),
         wasi: builder.build(),
-        http: WasiHttpCtx::new(),
+        http: WasiHttpCtx::new_with_acl(http_acl()),
         stderr,
         stdout,
         send_request: None,
@@ -148,7 +174,7 @@ async fn run_wasi_http(
     builder.stdout(stdout.clone());
     builder.stderr(stderr.clone());
     let wasi = builder.build();
-    let http = WasiHttpCtx::new();
+    let http = WasiHttpCtx::new_with_acl(http_acl());
     let ctx = Ctx {
         table,
         wasi,
