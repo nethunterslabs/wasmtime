@@ -39,6 +39,9 @@ impl WasiHttpCtx {
                     .host_acl_default(true)
                     .port_acl_default(true)
                     .ip_acl_default(true)
+                    .method_acl_default(true)
+                    .header_acl_default(true)
+                    .url_path_acl_default(true)
                     .build(),
             ),
             _priv: (),

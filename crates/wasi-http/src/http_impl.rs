@@ -141,6 +141,13 @@ where
         builder = builder.uri(uri.build().map_err(http_request_error)?);
 
         for (k, v) in req.headers.iter() {
+            let acl_header_match = acl.is_header_allowed(k, v);
+            if acl_header_match.is_denied() {
+                return Err(internal_error(format!(
+                    "Header {k}: {v} is not allowed - {acl_header_match}"
+                ))
+                .into());
+            }
             builder = builder.header(k, v);
         }
 
