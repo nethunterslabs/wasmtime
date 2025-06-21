@@ -157,6 +157,19 @@ where
                 .boxed()
         });
 
+        let acl_valid_match = acl.is_valid(
+            scheme,
+            &authority,
+            req.headers().iter(),
+            None,
+        );
+        if acl_valid_match.is_denied() {
+            return Err(internal_error(format!(
+                "Request is not allowed - {acl_valid_match}"
+            ))
+            .into());
+        }
+
         let request = builder
             .body(body)
             .map_err(|err| internal_error(err.to_string()))?;
