@@ -22,7 +22,7 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 http = { workspace = true }
-http-acl = "0.8.1"
+http-acl = "0.8.2"
 http-body = { workspace = true }
 http-body-util = { workspace = true }
 tracing = { workspace = true }

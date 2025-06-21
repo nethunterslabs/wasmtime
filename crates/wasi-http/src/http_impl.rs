@@ -88,7 +88,9 @@ where
             Scheme::Other(_) => return Err(types::ErrorCode::HttpProtocolError.into()),
         };
 
-        let acl_scheme_match = acl.is_scheme_allowed(scheme.as_str());
+        let scheme_str = scheme.as_str();
+
+        let acl_scheme_match = acl.is_scheme_allowed(scheme_str);
         if acl_scheme_match.is_denied() {
             return Err(internal_error(format!(
                 "Scheme {scheme} is not allowed - {acl_scheme_match}"
@@ -103,7 +105,7 @@ where
             Err(e) => return Err(internal_error(format!("invalid authority: {e}")).into()),
         };
         let port = if authority_parsed.port == 0 {
-            match scheme.as_str() {
+            match scheme_str {
                 "http" => 80,
                 "https" => 443,
                 _ => unreachable!(),
@@ -121,7 +123,7 @@ where
         builder = builder.header(hyper::header::HOST, &authority);
 
         let mut uri = http::Uri::builder()
-            .scheme(scheme)
+            .scheme(scheme.clone())
             .authority(authority.clone());
 
         if let Some(path) = req.path_with_query {
@@ -141,10 +143,16 @@ where
         builder = builder.uri(uri.build().map_err(http_request_error)?);
 
         for (k, v) in req.headers.iter() {
-            let acl_header_match = acl.is_header_allowed(k, v);
+            let acl_header_match = acl.is_header_allowed(
+                k.as_str(),
+                v.to_str().map_err(|e| {
+                    internal_error(format!("Invalid header value for {k}: {:?} - {e}", v))
+                })?,
+            );
             if acl_header_match.is_denied() {
                 return Err(internal_error(format!(
-                    "Header {k}: {v} is not allowed - {acl_header_match}"
+                    "Header {k}: {:?} is not allowed - {acl_header_match}",
+                    v
                 ))
                 .into());
             }
@@ -158,16 +166,17 @@ where
         });
 
         let acl_valid_match = acl.is_valid(
-            scheme,
-            &authority,
-            req.headers().iter(),
+            scheme_str,
+            &authority_parsed,
+            req.headers
+                .iter()
+                .filter_map(|(k, v)| Some((k.as_str(), v.to_str().ok()?))),
             None,
         );
         if acl_valid_match.is_denied() {
-            return Err(internal_error(format!(
-                "Request is not allowed - {acl_valid_match}"
-            ))
-            .into());
+            return Err(
+                internal_error(format!("Request is not allowed - {acl_valid_match}")).into(),
+            );
         }
 
         let request = builder
