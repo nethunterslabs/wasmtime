@@ -26,7 +26,7 @@ use wasmtime_wasi_http::bindings::http::types::{ErrorCode, Scheme};
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::{
     DEFAULT_OUTGOING_BODY_BUFFER_CHUNKS, DEFAULT_OUTGOING_BODY_CHUNK_SIZE, WasiHttpCtx,
-    WasiHttpView, body::HyperOutgoingBody,
+    WasiHttpView, body::HyperOutgoingBody, http_acl::HttpAcl,
 };
 
 #[cfg(feature = "wasi-config")]
@@ -177,7 +177,17 @@ impl ServeCommand {
         let mut host = Host {
             table: wasmtime::component::ResourceTable::new(),
             ctx: builder.build(),
-            http: WasiHttpCtx::new(),
+            http: WasiHttpCtx::new_with_acl(
+                HttpAcl::builder()
+                    .non_global_ip_ranges(true)
+                    .ip_acl_default(true)
+                    .host_acl_default(true)
+                    .port_acl_default(true)
+                    .method_acl_default(true)
+                    .header_acl_default(true)
+                    .url_path_acl_default(true)
+                    .build(),
+            ),
             http_outgoing_body_buffer_chunks: self.run.common.wasi.http_outgoing_body_buffer_chunks,
             http_outgoing_body_chunk_size: self.run.common.wasi.http_outgoing_body_chunk_size,
 

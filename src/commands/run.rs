@@ -21,6 +21,7 @@ use wasmtime_wasi_config::{WasiConfig, WasiConfigVariables};
 #[cfg(feature = "wasi-http")]
 use wasmtime_wasi_http::{
     DEFAULT_OUTGOING_BODY_BUFFER_CHUNKS, DEFAULT_OUTGOING_BODY_CHUNK_SIZE, WasiHttpCtx,
+    http_acl::HttpAcl,
 };
 #[cfg(feature = "wasi-keyvalue")]
 use wasmtime_wasi_keyvalue::{WasiKeyValue, WasiKeyValueCtx, WasiKeyValueCtxBuilder};
@@ -968,7 +969,17 @@ impl RunCommand {
                     }
                 }
 
-                store.data_mut().wasi_http = Some(Arc::new(WasiHttpCtx::new()));
+                store.data_mut().wasi_http = Some(Arc::new(WasiHttpCtx::new_with_acl(
+                    HttpAcl::builder()
+                        .non_global_ip_ranges(true)
+                        .ip_acl_default(true)
+                        .host_acl_default(true)
+                        .port_acl_default(true)
+                        .method_acl_default(true)
+                        .header_acl_default(true)
+                        .url_path_acl_default(true)
+                        .build(),
+                )));
             }
         }
 
