@@ -5,7 +5,10 @@ use core::pin::{Pin, pin};
 use core::task::{Poll, ready};
 use http::uri::Scheme;
 use http::{Request, Response};
+use http_acl::HttpAcl;
+use http_acl::utils::authority::{Authority, Host};
 use http_body::Body;
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -19,6 +22,98 @@ trait TokioStream: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static {
     }
 }
 impl<T> TokioStream for T where T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static {}
+
+/// Resolves `authority` (a `host:port` string), checking the host and each
+/// candidate address against `acl` before connecting, and connects to
+/// whichever resolved address succeeds first.
+///
+/// A trusted static DNS mapping (see
+/// [`add_trusted_static_dns_mapping`](http_acl::HttpAclBuilder::add_trusted_static_dns_mapping))
+/// bypasses the IP/port checks entirely, on the assumption that the embedder
+/// vouches for that destination; a regular static mapping (or a genuinely
+/// resolved address) is checked like any other candidate address.
+async fn connect_with_acl(
+    authority: &str,
+    connect_timeout: Duration,
+    acl: &HttpAcl,
+) -> Result<TcpStream, Error> {
+    let authority_parsed = Authority::parse(authority).map_err(|_| Error::HttpRequestUriInvalid)?;
+    let port = authority_parsed.port;
+
+    // Only ever `true` for a *trusted* static mapping: a regular static
+    // mapping still needs its one address checked below, same as any
+    // genuinely resolved address.
+    let mut trusted_static_mapping = false;
+
+    let tcp_addresses: Vec<SocketAddr> = match &authority_parsed.host {
+        Host::Domain(domain) => {
+            if let Some(tcp_address) = acl.resolve_trusted_static_dns_mapping(domain) {
+                trusted_static_mapping = true;
+                vec![tcp_address]
+            } else if let Some(tcp_address) = acl.resolve_static_dns_mapping(domain) {
+                vec![tcp_address]
+            } else {
+                let acl_host_match = acl.is_host_allowed(domain);
+                if acl_host_match.is_denied() {
+                    tracing::warn!("host {domain} is not allowed - {acl_host_match}");
+                    return Err(Error::HttpRequestDenied);
+                }
+
+                match tokio::time::timeout(
+                    connect_timeout,
+                    tokio::net::lookup_host((domain.as_str(), port)),
+                )
+                .await
+                {
+                    Ok(Ok(addrs)) => addrs.collect(),
+                    Ok(Err(e)) => {
+                        tracing::warn!("dns lookup error: {e:?}");
+                        return Err(Error::DnsError {
+                            rcode: None,
+                            info_code: None,
+                        });
+                    }
+                    Err(..) => return Err(Error::DnsTimeout),
+                }
+            }
+        }
+        Host::Ip(ip) => {
+            let acl_ip_match = acl.is_ip_allowed(ip);
+            if acl_ip_match.is_denied() {
+                tracing::warn!("IP {ip} is not allowed - {acl_ip_match}");
+                return Err(Error::DestinationIpProhibited);
+            }
+            vec![SocketAddr::new(*ip, port)]
+        }
+    };
+
+    if tcp_addresses.is_empty() {
+        return Err(Error::DnsError {
+            rcode: None,
+            info_code: None,
+        });
+    }
+
+    if !trusted_static_mapping {
+        for tcp_address in &tcp_addresses {
+            let acl_ip_match = acl.is_ip_allowed(&tcp_address.ip());
+            if acl_ip_match.is_denied() {
+                tracing::warn!("IP {} is not allowed - {}", tcp_address.ip(), acl_ip_match);
+                return Err(Error::DestinationIpProhibited);
+            }
+        }
+    }
+
+    match tokio::time::timeout(
+        connect_timeout,
+        TcpStream::connect(tcp_addresses.as_slice()),
+    )
+    .await
+    {
+        Ok(stream) => stream.map_err(Error::Connect),
+        Err(..) => Err(Error::ConnectionTimeout),
+    }
+}
 
 /// The default implementation of how an outgoing request is sent.
 ///
@@ -52,21 +147,29 @@ pub async fn default_send_request(
     };
 
     let connect_timeout = options
+        .as_ref()
         .and_then(|r| r.connect_timeout)
         .unwrap_or(Duration::from_secs(600));
 
     let first_byte_timeout = options
+        .as_ref()
         .and_then(|r| r.first_byte_timeout)
         .unwrap_or(Duration::from_secs(600));
 
     let between_bytes_timeout = options
+        .as_ref()
         .and_then(|r| r.between_bytes_timeout)
         .unwrap_or(Duration::from_secs(600));
 
-    let stream = match tokio::time::timeout(connect_timeout, TcpStream::connect(&authority)).await {
-        Ok(stream) => stream.map_err(Error::Connect)?,
-        Err(..) => return Err(Error::ConnectionTimeout),
-    };
+    // An ACL attached by `crate::p2::http_impl`/`crate::p3::host::handler` (via
+    // `RequestOptions::acl`) is checked here; a caller going through neither
+    // (e.g. calling this function directly) gets the same unrestricted
+    // behavior Wasmtime always had before ACL enforcement was added.
+    let acl = options
+        .and_then(|r| r.acl)
+        .unwrap_or_else(|| std::sync::Arc::new(crate::ctx::permissive_acl()));
+
+    let stream = connect_with_acl(&authority, connect_timeout, &acl).await?;
     let stream = if use_tls {
         // derived from https://github.com/rustls/rustls/blob/main/examples/src/bin/simpleclient.rs
         let root_cert_store = rustls::RootCertStore {

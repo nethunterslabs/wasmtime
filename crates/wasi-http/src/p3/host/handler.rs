@@ -1,10 +1,11 @@
 use crate::FieldMap;
 use crate::p3::bindings::http::client::{Host, HostWithStore};
-use crate::p3::bindings::http::types::{Request, Response};
+use crate::p3::bindings::http::types::{ErrorCode, Request, Response};
 use crate::p3::body::{Body, BodyExt as _};
 use crate::p3::{HttpError, HttpResult};
 use crate::{Error, WasiHttp, WasiHttpCtxView};
 use core::task::{Context, Poll, Waker};
+use http_acl::utils::authority::Authority;
 use http_body_util::BodyExt as _;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -60,9 +61,62 @@ impl<T> HostWithStore<T> for WasiHttp {
                 .map_err(HttpError::trap)?;
             let (req, options) =
                 req.into_http_with_getter(&mut store, io_task_result(io_result_rx), getter)?;
+
+            let acl = store.get().ctx.acl.clone();
+
+            let method = req.method().as_str();
+            let acl_method_match = acl.is_method_allowed(method);
+            if acl_method_match.is_denied() {
+                return Err(ErrorCode::InternalError(Some(format!(
+                    "method {method} is not allowed - {acl_method_match}"
+                )))
+                .into());
+            }
+
+            let scheme = req.uri().scheme_str().unwrap_or("");
+            let acl_scheme_match = acl.is_scheme_allowed(scheme);
+            if acl_scheme_match.is_denied() {
+                return Err(ErrorCode::InternalError(Some(format!(
+                    "scheme {scheme} is not allowed - {acl_scheme_match}"
+                )))
+                .into());
+            }
+
+            let authority_str = req.uri().authority().map(|a| a.as_str()).unwrap_or("");
+            let authority_parsed = Authority::parse(authority_str)
+                .map_err(|e| ErrorCode::InternalError(Some(format!("invalid authority: {e}"))))?;
+            let port = if authority_parsed.port == 0 {
+                match scheme {
+                    "http" => 80,
+                    "https" => 443,
+                    _ => 0,
+                }
+            } else {
+                authority_parsed.port
+            };
+            let acl_port_match = acl.is_port_allowed(port);
+            if acl_port_match.is_denied() {
+                return Err(ErrorCode::InternalError(Some(format!(
+                    "port {port} is not allowed - {acl_port_match}"
+                )))
+                .into());
+            }
+
+            let url_path = req.uri().path();
+            let acl_url_path_match = acl.is_url_path_allowed(url_path);
+            if acl_url_path_match.is_denied() {
+                return Err(ErrorCode::InternalError(Some(format!(
+                    "path {url_path} is not allowed - {acl_url_path_match}"
+                )))
+                .into());
+            }
+
+            let mut opts = options.as_deref().cloned().unwrap_or_default();
+            opts.acl = Some(acl);
+
             HttpResult::Ok(store.get().hooks.send_request(
                 req.map(|body| body.with_state(io_task_rx).boxed_unsync()),
-                options.as_deref().copied(),
+                Some(opts),
                 Box::new(async {
                     // Forward the response processing result to `WasiHttpCtx` implementation
                     let Ok(fut) = res_result_rx.await else {

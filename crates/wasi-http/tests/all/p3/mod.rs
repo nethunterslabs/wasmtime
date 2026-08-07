@@ -5,6 +5,7 @@ use flate2::write::{DeflateDecoder, DeflateEncoder};
 use futures::SinkExt;
 use futures::channel::oneshot;
 use http::HeaderValue;
+use http_acl::{HttpAcl, IpNet};
 use http_body::Body;
 use http_body_util::{BodyExt as _, Collected, Empty};
 use std::io::Write;
@@ -77,6 +78,22 @@ impl WasiHttpHooks for TestHooks {
     }
 }
 
+fn http_acl() -> HttpAcl {
+    HttpAcl::builder()
+        .non_global_ip_ranges(true)
+        .add_allowed_ip_range("127.0.0.1/8".parse::<IpNet>().unwrap())
+        .unwrap()
+        .add_allowed_ip_range("::1/128".parse::<IpNet>().unwrap())
+        .unwrap()
+        .ip_acl_default(true)
+        .host_acl_default(true)
+        .port_acl_default(true)
+        .method_acl_default(true)
+        .header_acl_default(true)
+        .url_path_acl_default(true)
+        .build()
+}
+
 struct Ctx {
     table: ResourceTable,
     wasi: WasiCtx,
@@ -89,7 +106,7 @@ impl Ctx {
         Self {
             table: ResourceTable::default(),
             wasi: WasiCtxBuilder::new().inherit_stdio().build(),
-            http: WasiHttpCtx::new(),
+            http: WasiHttpCtx::new_with_acl(http_acl()),
             hooks: TestHooks {
                 request_tx: Some(request_tx),
             },

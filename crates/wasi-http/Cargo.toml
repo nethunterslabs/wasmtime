@@ -33,6 +33,7 @@ tokio = { workspace = true, features = [
 ] }
 tokio-util = { workspace = true, optional = true }
 http = { workspace = true }
+http-acl = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
 tracing = { workspace = true }

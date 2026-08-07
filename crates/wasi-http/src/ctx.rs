@@ -5,7 +5,9 @@ use crate::p3::bindings::http::types as p3;
 use crate::{DEFAULT_FORBIDDEN_HEADERS, Error, RequestOptions, Result};
 use bytes::Bytes;
 use http::{HeaderName, uri::Scheme};
+use http_acl::HttpAcl;
 use http_body_util::combinators::UnsyncBoxBody;
+use std::sync::Arc;
 use wasmtime::component::{HasData, ResourceTable};
 
 /// A helper struct which implements [`HasData`] for the `wasi:http` APIs.
@@ -119,18 +121,57 @@ pub struct WasiHttpCtxView<'a> {
 /// consumption.
 const DEFAULT_FIELD_SIZE_LIMIT: usize = 128 * 1024;
 
+/// Builds the ACL used when a context (or a request that otherwise has no ACL
+/// attached, e.g. a direct call to [`crate::default_send_request`]) doesn't
+/// specify one of its own: every category is allowed by default, including
+/// non-global IP ranges, matching Wasmtime's behavior before ACL enforcement
+/// was added.
+pub(crate) fn permissive_acl() -> HttpAcl {
+    HttpAcl::builder()
+        .non_global_ip_ranges(true)
+        .ip_acl_default(true)
+        .host_acl_default(true)
+        .port_acl_default(true)
+        .method_acl_default(true)
+        .header_acl_default(true)
+        .url_path_acl_default(true)
+        .build()
+}
+
 /// Capture the state necessary for use in the wasi-http API implementation.
 #[derive(Debug, Clone)]
 pub struct WasiHttpCtx {
     pub(crate) field_size_limit: usize,
+    pub(crate) acl: Arc<HttpAcl>,
 }
 
 impl WasiHttpCtx {
     /// Create a new context.
+    ///
+    /// Outgoing requests are checked against a permissive ACL that allows
+    /// everything, including non-global IP ranges; use [`Self::new_with_acl`]
+    /// to restrict what a guest is allowed to reach (e.g. to guard against
+    /// SSRF when handling requests to arbitrary user-supplied URLs).
     pub fn new() -> Self {
         Self {
             field_size_limit: DEFAULT_FIELD_SIZE_LIMIT,
+            acl: Arc::new(permissive_acl()),
         }
+    }
+
+    /// Create a new context that checks outgoing requests against the
+    /// provided [`HttpAcl`].
+    pub fn new_with_acl(acl: HttpAcl) -> Self {
+        Self {
+            field_size_limit: DEFAULT_FIELD_SIZE_LIMIT,
+            acl: Arc::new(acl),
+        }
+    }
+
+    /// Returns the ACL that outgoing requests made through this context are
+    /// checked against.
+    pub fn acl(&self) -> &HttpAcl {
+        self.acl.as_ref()
     }
 
     /// Set the maximum size for any fields resources created by this context.

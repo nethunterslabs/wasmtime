@@ -28,6 +28,28 @@ impl outgoing_handler::Host for WasiHttpCtxView<'_> {
         let req = self.table.delete(request_id)?;
         let mut builder = hyper::Request::builder();
 
+        let acl = self.ctx.acl.clone();
+
+        let method_str = match &req.method {
+            types::Method::Get => "GET",
+            types::Method::Head => "HEAD",
+            types::Method::Post => "POST",
+            types::Method::Put => "PUT",
+            types::Method::Delete => "DELETE",
+            types::Method::Connect => "CONNECT",
+            types::Method::Options => "OPTIONS",
+            types::Method::Trace => "TRACE",
+            types::Method::Patch => "PATCH",
+            types::Method::Other(m) => m.as_str(),
+        };
+        let acl_method_match = acl.is_method_allowed(method_str);
+        if acl_method_match.is_denied() {
+            return Err(internal_error(format!(
+                "Method {method_str} is not allowed - {acl_method_match}",
+            ))
+            .into());
+        }
+
         builder = builder.method(match req.method {
             types::Method::Get => Method::GET,
             types::Method::Head => Method::HEAD,
@@ -52,13 +74,51 @@ impl outgoing_handler::Host for WasiHttpCtxView<'_> {
             Scheme::Other(_) => return Err(types::ErrorCode::HttpProtocolError.into()),
         };
 
+        let acl_scheme_match = acl.is_scheme_allowed(scheme.as_str());
+        if acl_scheme_match.is_denied() {
+            return Err(internal_error(format!(
+                "Scheme {scheme} is not allowed - {acl_scheme_match}"
+            ))
+            .into());
+        }
+
         let authority = req.authority.unwrap_or_else(String::new);
+
+        let authority_parsed = match http_acl::utils::authority::Authority::parse(&authority) {
+            Ok(a) => a,
+            Err(e) => return Err(internal_error(format!("invalid authority: {e}")).into()),
+        };
+        let port = if authority_parsed.port == 0 {
+            match scheme.as_str() {
+                "http" => 80,
+                "https" => 443,
+                _ => unreachable!(),
+            }
+        } else {
+            authority_parsed.port
+        };
+        let acl_port_match = acl.is_port_allowed(port);
+        if acl_port_match.is_denied() {
+            return Err(
+                internal_error(format!("Port {port} is not allowed - {acl_port_match}")).into(),
+            );
+        }
 
         let mut uri = http::Uri::builder()
             .scheme(scheme)
             .authority(authority.clone());
 
         if let Some(path) = req.path_with_query {
+            if let Some(url_path) = path.split('?').next() {
+                let acl_url_path_match = acl.is_url_path_allowed(url_path);
+                if acl_url_path_match.is_denied() {
+                    return Err(internal_error(format!(
+                        "URL Path {url_path} is not allowed - {acl_url_path_match}"
+                    ))
+                    .into());
+                }
+            }
+
             uri = uri.path_and_query(path);
         }
 
@@ -79,9 +139,12 @@ impl outgoing_handler::Host for WasiHttpCtxView<'_> {
             .body(body)
             .map_err(|err| internal_error(err.to_string()))?;
 
+        let mut opts = opts.unwrap_or_default();
+        opts.acl = Some(acl);
+
         let future = self
             .hooks
-            .send_request(request, opts, Box::new(async { Ok(()) }));
+            .send_request(request, Some(opts), Box::new(async { Ok(()) }));
         let future = wasmtime_wasi::runtime::spawn(async move {
             let (res, io) = Pin::from(future).await?;
             let io = wasmtime_wasi::runtime::spawn(async move {

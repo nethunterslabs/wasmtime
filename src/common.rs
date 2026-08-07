@@ -387,7 +387,16 @@ impl RunCommon {
 
     #[cfg(feature = "wasi-http")]
     pub fn wasi_http_ctx(&self) -> Result<wasmtime_wasi_http::WasiHttpCtx> {
-        let mut http = wasmtime_wasi_http::WasiHttpCtx::new();
+        let acl = wasmtime_wasi_http::http_acl::HttpAcl::builder()
+            .non_global_ip_ranges(true)
+            .ip_acl_default(true)
+            .host_acl_default(true)
+            .port_acl_default(true)
+            .method_acl_default(true)
+            .header_acl_default(true)
+            .url_path_acl_default(true)
+            .build();
+        let mut http = wasmtime_wasi_http::WasiHttpCtx::new_with_acl(acl);
         if let Some(limit) = self.common.wasi.max_http_fields_size {
             http.set_field_size_limit(limit);
         }

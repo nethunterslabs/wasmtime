@@ -11,6 +11,8 @@
 
 use http::{HeaderName, header};
 
+pub use http_acl;
+
 mod ctx;
 #[cfg(feature = "default-send-request")]
 mod default_send_request;
