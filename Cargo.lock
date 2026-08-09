@@ -297,9 +297,9 @@ checksum = "14c189c53d098945499cdfa7ecc63567cf3886b3332b312a5b4585d8d3a6a610"
 
 [[package]]
 name = "bytes"
-version = "1.11.1"
+version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "bytesize"
@@ -1885,10 +1885,11 @@ dependencies = [
 
 [[package]]
 name = "http-acl"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "232a02fa3d6156cff50f63c36ef3b7160746f44fbfbf0394a7ff3f45c349f40b"
+checksum = "766815a662bb2a2cea5d2cdfe806177530f8a37a0620f8e8985fa03a8d5ed906"
 dependencies = [
+ "bytes",
  "ipnet",
  "matchit",
  "percent-encoding",

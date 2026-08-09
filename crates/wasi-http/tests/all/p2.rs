@@ -1,7 +1,7 @@
 use crate::body;
 use crate::http_server::Server;
 use futures::{FutureExt, channel::oneshot, future, stream};
-use http_acl::{HttpAcl, IpNet};
+use http_acl::{HttpAcl, HttpAclHooks, IpNet};
 use http_body::Frame;
 use http_body_util::{BodyExt, Collected, Empty, StreamBody, combinators::BoxBody};
 use hyper::{Method, StatusCode, body::Bytes, server::conn::http1, service::service_fn};
@@ -122,6 +122,22 @@ fn http_acl() -> HttpAcl {
         .header_acl_default(true)
         .url_path_acl_default(true)
         .build()
+}
+
+fn http_acl_with_hooks(hooks: HttpAclHooks) -> HttpAcl {
+    HttpAcl::builder()
+        .non_global_ip_ranges(true)
+        .add_allowed_ip_range("127.0.0.1/8".parse::<IpNet>().unwrap())
+        .unwrap()
+        .add_allowed_ip_range("::1/128".parse::<IpNet>().unwrap())
+        .unwrap()
+        .ip_acl_default(true)
+        .host_acl_default(true)
+        .port_acl_default(true)
+        .method_acl_default(true)
+        .header_acl_default(true)
+        .url_path_acl_default(true)
+        .build_full(hooks)
 }
 
 fn store(engine: &Engine, server: &Server) -> Store<Ctx> {
@@ -267,6 +283,151 @@ async fn run_wasi_http(
         handle.await.context("Component execution")?;
         Ok(Err(ErrorCode::HttpResponseTimeout))
     }
+}
+
+/// Same as [`run_wasi_http`], but with a caller-supplied ACL instead of the fixed
+/// [`http_acl`] - used to exercise `ModifyRequestFn`/`ModifyResponseFn` end to end,
+/// through the real `default_send_request` network path.
+async fn run_wasi_http_with_acl(
+    acl: HttpAcl,
+    component_filename: &str,
+    req: hyper::Request<BoxBody<Bytes, hyper::Error>>,
+) -> wasmtime::Result<Result<hyper::Response<Collected<Bytes>>, ErrorCode>> {
+    let stdout = MemoryOutputPipe::new(4096);
+    let stderr = MemoryOutputPipe::new(4096);
+    let table = ResourceTable::new();
+
+    let mut config = Config::new();
+    config.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
+    config.wasm_component_model(true);
+    let engine = Engine::new(&config).context("creating engine")?;
+    let component =
+        Component::from_file(&engine, component_filename).context("loading component")?;
+
+    let mut builder = WasiCtx::builder();
+    builder.stdout(stdout.clone());
+    builder.stderr(stderr.clone());
+    let wasi = builder.build();
+    let http = WasiHttpCtx::new_with_acl(acl);
+    let ctx = Ctx {
+        table,
+        wasi,
+        http,
+        stderr,
+        stdout,
+        hooks: MyHttpHooks {
+            send_request: None,
+            rejected_authority: None,
+        },
+    };
+    let mut store = Store::new(&engine, ctx);
+
+    let mut linker = Linker::new(&engine);
+    wasmtime_wasi_http::p2::add_to_linker_async(&mut linker).context("add crate to linker")?;
+    let proxy =
+        wasmtime_wasi_http::p2::bindings::Proxy::instantiate_async(&mut store, &component, &linker)
+            .await
+            .context("instantiate proxy")?;
+
+    let req = store
+        .data_mut()
+        .http()
+        .new_incoming_request(Scheme::Http, req)
+        .context("new incoming request")?;
+
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let out = store
+        .data_mut()
+        .http()
+        .new_response_outparam(sender)
+        .context("new response outparam")?;
+
+    let handle = wasmtime_wasi::runtime::spawn(async move {
+        proxy
+            .wasi_http_incoming_handler()
+            .call_handle(&mut store, req, out)
+            .await
+            .context("calling incoming handler")?;
+
+        Ok::<_, wasmtime::Error>(())
+    });
+
+    let resp = match receiver.await {
+        Ok(Ok(resp)) => {
+            let (parts, body) = resp.into_parts();
+            let collected = BodyExt::collect(body).await.context("collecting body")?;
+            Some(Ok(hyper::Response::from_parts(parts, collected)))
+        }
+        Ok(Err(e)) => Some(Err(e)),
+        Err(_) => None,
+    };
+
+    handle.await.context("awaiting execution")?;
+
+    Ok(resp.context("wasm never called set-response-outparam")?)
+}
+
+#[test_log::test(tokio::test)]
+async fn wasi_http_modify_request_and_response() -> wasmtime::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 1), 0)).await?;
+    let addr = listener.local_addr()?;
+
+    let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+    task::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap_or(0);
+            let _ = captured_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let body = "original body";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nx-remove-me: yes\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+
+    let acl = http_acl_with_hooks(HttpAclHooks {
+        modify_request_fn: Some(Arc::new(|_scheme, _authority, mutation| {
+            mutation
+                .headers
+                .push(("x-injected-secret".to_string(), "sssh".to_string()));
+        })),
+        modify_response_fn: Some(Arc::new(|_scheme, _authority, mutation| {
+            mutation.status = 201;
+            mutation.headers.retain(|(k, _)| k != "x-remove-me");
+            mutation.body = bytes::Bytes::from_static(b"redacted body");
+        })),
+        ..Default::default()
+    });
+
+    let req = hyper::Request::builder()
+        .method(http::Method::GET)
+        .uri(format!("http://127.0.0.1:{}/", addr.port()));
+
+    let response = run_wasi_http_with_acl(
+        acl,
+        test_programs_artifacts::P2_API_PROXY_FORWARD_REQUEST_COMPONENT,
+        req.body(body::empty())?,
+    )
+    .await??;
+
+    let captured = captured_rx.await.unwrap();
+    assert!(
+        captured.to_lowercase().contains("x-injected-secret: sssh"),
+        "captured request did not contain the injected header:\n{captured}"
+    );
+
+    assert_eq!(StatusCode::from_u16(201).unwrap(), response.status());
+    assert!(!response.headers().contains_key("x-remove-me"));
+    let body = response.into_body().to_bytes();
+    assert_eq!(&body[..], b"redacted body");
+
+    Ok(())
 }
 
 #[test_log::test(tokio::test)]
